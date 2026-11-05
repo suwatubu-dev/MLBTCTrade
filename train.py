@@ -30,16 +30,26 @@ def fetch_data_from_google_sheets(sheet_name="Sheet1"):
     creds_dict = json.loads(gcp_json_str)
     gc = gspread.service_account_from_dict(creds_dict)
     
-    # ตรวจสอบและเปิดไฟล์ Google Sheet (รองรับทั้งเปิดด้วย sheet_id และ openall)
     if "sheet_id" in creds_dict and creds_dict["sheet_id"]:
         sh = gc.open_by_key(creds_dict["sheet_id"])
     else:
         sh = gc.openall()[0]
         
-    worksheet = sh.worksheet(sheet_name) if sheet_name in [ws.title for ws in sh.worksheets()] else sh.get_worksheet(0)
+    # พิมพ์รายชื่อ Worksheet ทั้งหมดที่มีในไฟล์ เพื่อตรวจสอบชื่อชีท
+    available_sheets = [ws.title for ws in sh.worksheets()]
+    print(f"📋 รายชื่อ Worksheet ทั้งหมดใน Google Sheet: {available_sheets}")
+    
+    # เลือกชีทตามชื่อ หรือถ้าไม่เจอให้เลือกชีทแรกที่มีข้อมูล (หรือเปลี่ยนชื่อชีทที่นี่ถ้าจำเป็น)
+    if sheet_name in available_sheets:
+        worksheet = sh.worksheet(sheet_name)
+    else:
+        print(f"⚠️ ไม่พบชีทชื่อ '{sheet_name}' จะใช้ชีทแรกแทน: {available_sheets[0]}")
+        worksheet = sh.get_worksheet(0)
     
     records = worksheet.get_all_records()
-    return pd.DataFrame(records)
+    df = pd.DataFrame(records)
+    print(f"🔍 คอลัมน์ที่อ่านได้จากชีท: {list(df.columns)}")
+    return df
 
 
 # ── 1. อ่านและแปลงข้อมูล ─────────────────────────────────────────────────────────
@@ -69,7 +79,6 @@ def legacy_raw(row):
 
 
 def load_dataset_from_df(df, use_legacy, pnl_threshold):
-    # ตัดช่องว่างรอบชื่อคอลัมน์ทั้งหมดเพื่อป้องกันปัญหาชื่อคอลัมน์มี space แฝง
     df.columns = [str(c).strip() for c in df.columns]
     
     rows, skipped = [], {"not_closed": 0, "no_pnl": 0, "no_features": 0}
@@ -77,13 +86,11 @@ def load_dataset_from_df(df, use_legacy, pnl_threshold):
     for i, r in df.iterrows():
         row = r.to_dict()
         
-        # ตรวจสอบสถานะ (ถ้ามีคอลัมน์ status และไม่ใช่ CLOSED ถึงจะข้าม)
         status = str(row.get("status", "")).strip().upper()
         if status and status not in ["CLOSED", "NAN", "NONE", ""]:
             skipped["not_closed"] += 1
             continue
             
-        # ค้นหาค่า PnL จากชื่อคอลัมน์ที่เป็นไปได้ทั้งหมด
         raw_pnl = None
         for col_name in ["netPnl", "net_pnl", "pnl", "grossPnl"]:
             if col_name in row and row[col_name] is not None and str(row[col_name]).strip() != "":
@@ -184,7 +191,8 @@ def main():
         df = pd.read_csv(args.csv)
     else:
         print("🌐 กำลังดึงข้อมูลจาก Google Sheets...")
-        df = fetch_data_from_google_sheets()
+        # หากชื่อชีทจริงไม่ใช่ "Sheet1" สามารถเปลี่ยนพารามิเตอร์ตรงนี้ได้ เช่น fetch_data_from_google_sheets("ชื่อชีทของคุณ")
+        df = fetch_data_from_google_sheets("Sheet1")
 
     data, skipped = load_dataset_from_df(df, use_legacy=not args.no_legacy, pnl_threshold=args.pnl_threshold)
     n_samples = len(data)
