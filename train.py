@@ -76,7 +76,8 @@ def load_dataset_from_df(df, use_legacy, pnl_threshold):
         if "status" in row and str(row["status"]).strip().upper() != "CLOSED":
             skipped["not_closed"] += 1
             continue
-        pnl = to_num(row.get("netPnl"))
+        # ดึงค่าจากคอลัมน์ netPnl หรือ pnl เผื่อกรณีสำรอง
+        pnl = to_num(row.get("netPnl") if "netPnl" in row else row.get("pnl"))
         if pnl is None:
             skipped["no_pnl"] += 1
             continue
