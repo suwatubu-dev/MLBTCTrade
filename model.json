@@ -1,5 +1,5 @@
 {
-  "modelVersion": "20261105-064009",
+  "modelVersion": "20261105-070103",
   "nTrain": 6,
   "features": [
     "rsi_dir",
@@ -56,30 +56,30 @@
     "isShort": 0.5
   },
   "coefficients": {
-    "rsi_dir": -0.18923528466130057,
+    "rsi_dir": -0.18923528466130068,
     "rsiH1_dir": 0.0,
     "rsiH4_dir": 0.0,
     "stoch_dir": 0.0,
     "macdHist_dir": -0.38118016608396676,
-    "macdLine_dir": 0.14956883573608734,
+    "macdLine_dir": 0.14956883573608729,
     "taker_dir": 0.0,
     "oi_dir": 0.0,
     "funding_dir": 0.0,
     "premium_dir": 0.0,
-    "atrPct": 0.4634859140029182,
-    "volRatio_log": -0.011336225019159218,
+    "atrPct": 0.4634859140029183,
+    "volRatio_log": -0.011336225019159272,
     "volPercentile": 0.0,
     "score_n": 0.0,
-    "edge_n": -0.719786941507685,
-    "isShort": 0.2751524097402486
+    "edge_n": -0.7197869415076847,
+    "isShort": 0.2751524097402487
   },
   "intercept": 2.0713220783371686,
   "walkForward": {
     "n_oos": 2,
     "auc": null,
-    "brier": 0.4383228229571143,
+    "brier": 0.4383228229571142,
     "brier_baseline": 0.0625,
-    "brier_improvement": -0.3758228229571143,
+    "brier_improvement": -0.3758228229571142,
     "accuracy@0.5": 0.0,
     "accuracy_majority_baseline": 1.0
   },
