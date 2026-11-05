@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: btc-ml-api
+    runtime: python
+    plan: free            # free จะหลับเมื่อไม่มีคนเรียกราว 15 นาที (ปลุกช้า) — แนะนำแผนเสียเงินถ้าใช้จริง
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: API_KEY
+        generateValue: true   # Render สร้างคีย์ให้ ไปคัดลอกจาก Dashboard ไปใส่ credential ใน n8n
