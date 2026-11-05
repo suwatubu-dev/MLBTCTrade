@@ -30,8 +30,7 @@ def fetch_data_from_google_sheets(sheet_name="Sheet1"):
     creds_dict = json.loads(gcp_json_str)
     gc = gspread.service_account_from_dict(creds_dict)
     
-    # ⚠️ ใส่ชื่อไฟล์ Google Sheet ของคุณตรงนี้ (หรือใช้ URL/Key แทนได้)
-    # เช่น gc.open("BTC_Trading_Log").worksheet(sheet_name)
+    # ใส่ชื่อไฟล์ Google Sheet ของคุณตรงนี้ (หรือใช้ URL/Key แทนได้)
     sh = gc.open_by_key(creds_dict.get("sheet_id", "")) if "sheet_id" in creds_dict else gc.open_all()[0]
     worksheet = sh.worksheet(sheet_name) if sheet_name in [ws.title for ws in sh.worksheets()] else sh.get_worksheet(0)
     
@@ -149,7 +148,58 @@ def walk_forward(X, y, C):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", default=None, help="ถ้าใส่ path csv จะอ่านจากไฟล์แทน Google Sheets")
-    ap.add_argument("--out", default="model.json")
-    ap.add_argument("--min-train", type=int, default=100)
-    ap.add_argument("--min-enforce", type=int, default=200)
-    ap.add_argument("--min
+    ap.add_argument("--out", default="model.json", help="Path สำหรับเซฟไฟล์โมเดล JSON")
+    ap.add_argument("--min-train", type=int, default=10, help="จำนวนข้อมูลขั้นต่ำสำหรับเทรน")
+    ap.add_argument("--min-enforce", type=int, default=50, help="จำนวนข้อมูลขั้นต่ำสำหรับบังคับใช้โมเดล")
+    ap.add_argument("--pnl-threshold", type=float, default=0.0, help="เกณฑ์กำไร PnL สำหรับตัดสินชนะ/แพ้")
+    ap.add_argument("--C", type=float, default=1.0, help="ค่า Regularization C ของ LogisticRegression")
+    ap.add_argument("--force", action="store_true", help="บังคับสร้างโมเดลแม้ข้อมูลน้อยกว่า min-train")
+    ap.add_argument("--no-legacy", action="store_true", help="ปิดการดึงฟีเจอร์แบบเก่า")
+    args = ap.parse_args()
+
+    print("🚀 เริ่มต้นกระบวนการเทรนโมเดล...")
+
+    if args.csv:
+        print(f"📖 กำลังโหลดข้อมูลจากไฟล์ CSV: {args.csv}")
+        df = pd.read_csv(args.csv)
+    else:
+        print("🌐 กำลังดึงข้อมูลจาก Google Sheets...")
+        df = fetch_data_from_google_sheets()
+
+    data, skipped = load_dataset_from_df(df, use_legacy=not args.no_legacy, pnl_threshold=args.pnl_threshold)
+    n_samples = len(data)
+
+    print(f"📊 โหลดข้อมูลเสร็จสิ้น: ทั้งหมด {len(df)} แถว, ข้อมูลพร้อมเทรน {n_samples} แถว (Skipped: {skipped})")
+
+    if n_samples < args.min_train and not args.force:
+        print(f"⚠️ ข้อมูลไม่เพียงพอสำหรับเทรน (ต้องการขั้นต่ำ {args.min_train} แถว แต่มี {n_samples} แถว)")
+        sys.exit(0)
+
+    features = [f for f in MODEL_FEATURES if f in data.columns]
+    X = data[features]
+    y = data["y"]
+
+    mean, std, lr = fit_model(X, y, args.C)
+    wf_metrics = walk_forward(X, y, args.C)
+
+    model_artifact = {
+        "modelVersion": dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S"),
+        "nTrain": n_samples,
+        "features": features,
+        "mean": mean.to_dict(),
+        "std": std.to_dict(),
+        "coefficients": dict(zip(features, lr.coef_[0].tolist())),
+        "intercept": float(lr.intercept_[0]),
+        "walkForward": wf_metrics,
+        "ready": True,
+        "enforceOk": n_samples >= args.min_enforce
+    }
+
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(model_artifact, f, indent=2)
+
+    print(f"✅ บันทึกโมเดลเรียบร้อยแล้วไปที่: {args.out}")
+
+
+if __name__ == "__main__":
+    main()
