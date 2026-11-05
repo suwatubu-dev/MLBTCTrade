@@ -213,3 +213,23 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+  import os
+import json
+import gspread
+
+# ดึง JSON Credentials จาก GitHub Secrets
+gcp_json_str = os.environ.get("GCP_CREDENTIALS_JSON")
+if gcp_json_str:
+    creds_dict = json.loads(gcp_json_str)
+    gc = gspread.service_account_from_dict(creds_dict)
+else:
+    raise ValueError("Missing GCP_CREDENTIALS_JSON environment variable")
+
+# --- โค้ดส่วนดึงข้อมูล เทรนโมเดล และเซฟ model.json ของคุณตามปกติ ---
+# ... (วางโค้ด Feature Engineering & Logistic Regression) ...
+
+# เซฟไฟล์ออกมาที่ root ของโปรเจกต์
+with open("model.json", "w") as f:
+    json.dump(model_data, f)
+
+print("Training finished & model.json created successfully!")
