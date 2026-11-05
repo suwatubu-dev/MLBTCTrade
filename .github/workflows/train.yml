@@ -1,0 +1,33 @@
+name: Auto Train ML Model
+
+on:
+  workflow_dispatch: # เปิดรับสัญญาณ Trigger จาก n8n
+
+jobs:
+  train-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install pandas numpy scikit-learn gspread
+
+      - name: Execute Training Script
+        env:
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+        run: |
+          python train.py --force
+
+      - name: Commit and Push Updated model.json
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "action@github.com"
+          git add model.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update model.json via GitHub Actions" && git push)
