@@ -69,18 +69,32 @@ def legacy_raw(row):
 
 
 def load_dataset_from_df(df, use_legacy, pnl_threshold):
+    # ตัดช่องว่างรอบชื่อคอลัมน์ทั้งหมดเพื่อป้องกันปัญหาชื่อคอลัมน์มี space แฝง
+    df.columns = [str(c).strip() for c in df.columns]
+    
     rows, skipped = [], {"not_closed": 0, "no_pnl": 0, "no_features": 0}
 
     for i, r in df.iterrows():
         row = r.to_dict()
-        if "status" in row and str(row["status"]).strip().upper() != "CLOSED":
+        
+        # ตรวจสอบสถานะ (ถ้ามีคอลัมน์ status และไม่ใช่ CLOSED ถึงจะข้าม)
+        status = str(row.get("status", "")).strip().upper()
+        if status and status not in ["CLOSED", "NAN", "NONE", ""]:
             skipped["not_closed"] += 1
             continue
-        # ดึงค่าจากคอลัมน์ netPnl หรือ pnl เผื่อกรณีสำรอง
-        pnl = to_num(row.get("netPnl") if "netPnl" in row else row.get("pnl"))
+            
+        # ค้นหาค่า PnL จากชื่อคอลัมน์ที่เป็นไปได้ทั้งหมด
+        raw_pnl = None
+        for col_name in ["netPnl", "net_pnl", "pnl", "grossPnl"]:
+            if col_name in row and row[col_name] is not None and str(row[col_name]).strip() != "":
+                raw_pnl = row[col_name]
+                break
+                
+        pnl = to_num(raw_pnl)
         if pnl is None:
             skipped["no_pnl"] += 1
             continue
+            
         raw = None
         for col in FEATURE_COLS:
             if col in row:
@@ -92,6 +106,7 @@ def load_dataset_from_df(df, use_legacy, pnl_threshold):
         if raw is None:
             skipped["no_features"] += 1
             continue
+            
         rows.append({
             "t": row.get("openTime", ""), "idx": i, "y": 1 if pnl > pnl_threshold else 0,
             "pnl": pnl, **engineer(raw),
