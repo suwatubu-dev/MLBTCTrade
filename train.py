@@ -30,8 +30,12 @@ def fetch_data_from_google_sheets(sheet_name="Sheet1"):
     creds_dict = json.loads(gcp_json_str)
     gc = gspread.service_account_from_dict(creds_dict)
     
-    # ใส่ชื่อไฟล์ Google Sheet ของคุณตรงนี้ (หรือใช้ URL/Key แทนได้)
-    sh = gc.open_by_key(creds_dict.get("sheet_id", "")) if "sheet_id" in creds_dict else gc.open_all()[0]
+    # ตรวจสอบและเปิดไฟล์ Google Sheet (รองรับทั้งเปิดด้วย sheet_id และ openall)
+    if "sheet_id" in creds_dict and creds_dict["sheet_id"]:
+        sh = gc.open_by_key(creds_dict["sheet_id"])
+    else:
+        sh = gc.openall()[0]
+        
     worksheet = sh.worksheet(sheet_name) if sheet_name in [ws.title for ws in sh.worksheets()] else sh.get_worksheet(0)
     
     records = worksheet.get_all_records()
