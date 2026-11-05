@@ -3,9 +3,6 @@ app.py — บริการทำนายความน่าจะเป็
 
   GET  /health    ตรวจสถานะ + เวอร์ชันโมเดล
   POST /predict   รับค่าดิบจาก n8n -> คืน prob (ความน่าจะเป็นที่ netPnl > 0)
-
-ทำนายด้วยคณิตศาสตร์ล้วน (logistic regression จาก model.json) ไม่ต้องใช้ numpy/sklearn ตอนรัน
-ถ้าไม่มี model.json จะตอบ ready=false และ prob=null (n8n จะข้ามไป ไม่กระทบการเทรด)
 """
 import hmac
 import json
@@ -51,13 +48,18 @@ def predict_prob(model: Dict[str, Any], raw: Dict[str, Any]):
     feats = engineer(raw)
     missing = [k for k in model["features"] if feats.get(k) is None]
     logit = float(model["intercept"])
+    
+    # รองรับทั้งคีย์ "coefficients" (จาก train.py) และเผื่อกรณี "coef"
+    coef_dict = model.get("coefficients", model.get("coef", {}))
+    
     for k in model["features"]:
         v = feats.get(k)
         if v is None:
-            continue                          # ขาดค่า = ใช้ค่าเฉลี่ย (z = 0)
+            continue                            # ขาดค่า = ใช้ค่าเฉลี่ย (z = 0)
         std = max(float(model["std"][k]), 1e-9)
         z = max(-Z_CLIP, min(Z_CLIP, (v - float(model["mean"][k])) / std))
-        logit += float(model["coef"][k]) * z
+        logit += float(coef_dict.get(k, 0.0)) * z
+        
     prob = 1.0 / (1.0 + math.exp(-max(-35.0, min(35.0, logit))))
     return prob, missing
 
@@ -68,8 +70,8 @@ def health():
     return {
         "status": "ok",
         "ready": MODEL is not None,
-        "modelVersion": MODEL.get("version") if MODEL else None,
-        "nTrain": MODEL.get("n_train") if MODEL else 0,
+        "modelVersion": MODEL.get("modelVersion") if MODEL else None,
+        "nTrain": MODEL.get("nTrain") if MODEL else 0,
     }
 
 
@@ -83,9 +85,9 @@ def predict(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = Head
     return {
         "prob": round(prob, 4),
         "ready": True,
-        "enforceOk": bool(MODEL.get("enforce_ok", False)),
-        "modelVersion": MODEL.get("version"),
-        "nTrain": MODEL.get("n_train"),
+        "enforceOk": bool(MODEL.get("enforceOk", False)),
+        "modelVersion": MODEL.get("modelVersion"),
+        "nTrain": MODEL.get("nTrain"),
         "missing": missing,
         "note": "",
     }
