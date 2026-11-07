@@ -1,5 +1,5 @@
 {
-  "modelVersion": "20261106-070049",
+  "modelVersion": "20261107-060052",
   "nTrain": 9,
   "features": [
     "rsi_dir",
