@@ -2,10 +2,16 @@
 features.py — แปลงค่าดิบจาก workflow เป็นฟีเจอร์ของโมเดล (ใช้ร่วมกันทั้งตอนเทรนและตอนทำนาย)
 
 หลักคิด: ทำให้ฟีเจอร์ "มีทิศทาง" (directional) ด้วยการคูณ +1 (LONG) / -1 (SHORT)
-เพื่อให้โมเดลตัวเดียวใช้ได้ทั้งสองฝั่ง เช่น RSI = 70 เป็นข้อดีของ LONG แต่เป็นข้อเสียของ SHORT
-ค่าที่ได้จึงอ่านความหมายได้ตรงกันเสมอว่า "บวก = เอื้อต่อทิศทางที่เข้าไม้"
+เพื่อให้โมเดลตัวเดียวใช้ได้ทั้งสองฝั่ง ค่าที่ได้คือ "บวก = ไปทางเดียวกับทิศทางที่เข้าไม้"
+(ความหมายว่าเอื้อหรือไม่เอื้อ โมเดลเรียนรู้เองผ่าน coefficient ไม่ได้ถูกกำหนดตายตัว)
+
+การเปลี่ยนแปลงจากเวอร์ชันก่อน:
+  - side ว่าง/ไม่รู้จัก -> raise ValueError (เดิมถูกตีเป็น LONG เงียบ ๆ)
+  - Z_CLIP อยู่ที่เดียว (ใช้ร่วมกับ train.py / app.py)
+  - to_num ไม่แปลง "0,5" เป็น 5.0 อีกต่อไป (comma แบบทศนิยมถือว่ากำกวม -> None)
 """
 import math
+import re
 
 # คีย์ดิบที่ n8n ส่งมา (และบันทึกลงชีตเป็น JSON ตอนเข้าไม้)
 RAW_KEYS = [
@@ -29,27 +35,57 @@ MODEL_FEATURES = [
     "score_n", "edge_n", "isShort",
 ]
 
+# ค่า clip ของ z-score (ใช้ร่วมกันทั้งตอนเทรนและตอนทำนาย)
+Z_CLIP = 5.0
+
+LONG_SIDES = {"LONG", "BUY", "BULLISH"}
+SHORT_SIDES = {"SHORT", "SELL", "BEARISH"}
+
+_THOUSANDS = re.compile(r"^[+-]?\d{1,3}(,\d{3})+(\.\d+)?$")
+
 
 def to_num(v):
-    """แปลงเป็นตัวเลข; ค่าว่าง/NaN/inf/ข้อความที่แปลงไม่ได้ -> None"""
+    """แปลงเป็นตัวเลข; ค่าว่าง/NaN/inf/ข้อความที่แปลงไม่ได้/comma กำกวม -> None"""
     if v is None or isinstance(v, bool):
         return None
-    try:
-        x = float(str(v).replace(",", "").strip()) if not isinstance(v, (int, float)) else float(v)
-    except (TypeError, ValueError):
-        return None
+    if isinstance(v, (int, float)):
+        x = float(v)
+    else:
+        s = str(v).strip()
+        if not s:
+            return None
+        if "," in s:
+            if _THOUSANDS.match(s):
+                s = s.replace(",", "")      # 1,234.5 -> 1234.5
+            else:
+                return None                 # "0,5" กำกวม (ทศนิยมแบบยุโรป?) -> ไม่เดา
+        try:
+            x = float(s)
+        except ValueError:
+            return None
     return x if math.isfinite(x) else None
 
 
 def direction(side):
-    """+1 = LONG, -1 = SHORT"""
+    """+1 = LONG, -1 = SHORT, None = ไม่รู้จัก (ห้ามเดา)"""
     s = str(side or "").strip().upper()
-    return -1 if s in ("SHORT", "SELL", "BEARISH") else 1
+    if s in SHORT_SIDES:
+        return -1
+    if s in LONG_SIDES:
+        return 1
+    return None
 
 
 def engineer(raw):
-    """raw(dict) -> dict ของ MODEL_FEATURES (ค่าที่คำนวณไม่ได้ = None)"""
+    """raw(dict) -> dict ของ MODEL_FEATURES (ค่าที่คำนวณไม่ได้ = None)
+    raise ValueError ถ้า side ว่างหรือไม่รู้จัก"""
+    if not isinstance(raw, dict):
+        raise ValueError("raw must be an object")
+
     d = direction(raw.get("side"))
+    if d is None:
+        raise ValueError("invalid or missing side")
+
     g = lambda k: to_num(raw.get(k))
 
     def dirs(key, center=0.0, scale=1.0):
