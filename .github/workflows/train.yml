@@ -1,33 +1,147 @@
 name: Auto Train ML Model
 
+# ถูกสั่งรันจาก n8n (GitHub API: POST .../actions/workflows/train.yml/dispatches)
+# ไม่ต้องใส่ schedule/cron เพิ่ม ไม่งั้นจะเทรนซ้ำสองทาง
 on:
-  workflow_dispatch: # เปิดรับสัญญาณ Trigger จาก n8n
+  workflow_dispatch:
+
+permissions:
+  contents: write          # ต้องใช้ push model.json กลับเข้า repo
+
+concurrency:
+  group: train-model       # กันรันซ้อนกัน (เช่น n8n ยิงซ้ำ)
+  cancel-in-progress: false
 
 jobs:
   train-and-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: "3.12"
 
-      - name: Install Dependencies
-        run: |
-          pip install pandas numpy scikit-learn gspread
+      - name: Install dependencies
+        run: pip install numpy pandas scikit-learn gspread
 
-      - name: Execute Training Script
+      # เทรนไปที่ model.new.json ก่อน — model.json เดิมยังไม่ถูกแตะจนกว่าจะตัดสินใจ commit
+      - name: Train
         env:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
-        run: |
-          python train.py --force
+          SHEET_ID: ${{ secrets.SHEET_ID }}               # ไม่บังคับ: ถ้าว่างจะใช้ sheet_id ใน GCP_CREDENTIALS_JSON
+          SHEET_NAME: ${{ vars.SHEET_NAME || 'Sheet1' }}  # ตั้งใน Settings > Variables ถ้าชื่อชีทไม่ใช่ Sheet1
+          TRAIN_ARGS: ${{ vars.TRAIN_ARGS }}              # ไม่บังคับ เช่น "--no-legacy --min-enforce 200"
+        run: python train.py --out model.new.json $TRAIN_ARGS
 
-      - name: Commit and Push Updated model.json
+      # ตัดสินใจว่าจะ commit ไหม และต้องแจ้งเตือนไหม
+      - name: Decide
+        id: decide
+        env:
+          MIN_NEW_ROWS: ${{ vars.MIN_NEW_ROWS || '5' }}   # ข้อมูลใหม่อย่างน้อยกี่แถวถึงจะ commit (ถ้าไม่มีอย่างอื่นเปลี่ยน)
         run: |
-          git config --global user.name "GitHub Actions Bot"
-          git config --global user.email "action@github.com"
+          python - <<'PY'
+          import json, os
+
+          def load(p):
+              try:
+                  with open(p, encoding="utf-8") as f:
+                      return json.load(f)
+              except (FileNotFoundError, json.JSONDecodeError):
+                  return None
+
+          new, old = load("model.new.json"), load("model.json")
+          min_new = int(os.environ.get("MIN_NEW_ROWS") or 5)
+          res = {"commit": "false", "notify": "false"}
+          lines, msg = [], ""
+
+          if new is None:
+              lines.append("ไม่มีโมเดลใหม่ (ข้อมูลไม่พอหรือ label มีคลาสเดียว) — คง model.json เดิม")
+          else:
+              n_new = int(new.get("nTrain", 0))
+              enf_new = bool(new.get("enforceOk"))
+              wf = new.get("walkForward") or {}
+              auc = wf.get("auc")
+              bimp = wf.get("brier_improvement")
+              why = None
+              if old is None:
+                  why = "ยังไม่มี model.json"
+              elif old.get("features") != new.get("features"):
+                  why = "features เปลี่ยน"
+              elif bool(old.get("enforceOk")) != enf_new:
+                  why = f"enforceOk เปลี่ยนเป็น {enf_new}"
+              elif n_new < int(old.get("nTrain", 0)):
+                  why = "จำนวนข้อมูลลดลง"
+              elif n_new - int(old.get("nTrain", 0)) >= min_new:
+                  why = f"ข้อมูลเพิ่ม >= {min_new} แถว"
+
+              if why:
+                  res["commit"] = "true"
+                  lines.append(f"จะ commit model.json: {why}")
+              else:
+                  lines.append("ไม่มีการเปลี่ยนแปลงที่มีนัยสำคัญ — ไม่ commit (ไม่ trigger deploy)")
+
+              lines.append(f"nTrain={n_new} enforceOk={enf_new} AUC={auc} brierImprovement={bimp}")
+              reasons = "; ".join(new.get("gateReasons") or [])
+
+              if not enf_new:
+                  res["notify"] = "true"
+                  msg = (f"⚠️ ML gate ไม่ผ่าน (enforceOk=false)\n"
+                         f"nTrain={n_new} AUC={auc} brierImprovement={bimp}\n"
+                         f"เหตุผล: {reasons}")
+              elif old is not None and not old.get("enforceOk"):
+                  res["notify"] = "true"
+                  msg = f"✅ ML gate ผ่านแล้ว (enforceOk=true)\nnTrain={n_new} AUC={auc} brierImprovement={bimp}"
+
+          with open(os.environ.get("GITHUB_OUTPUT", os.devnull), "a", encoding="utf-8") as f:
+              for k, v in res.items():
+                  f.write(f"{k}={v}\n")
+          with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a", encoding="utf-8") as f:
+              f.write("### Train result\n" + "\n".join(f"- {l}" for l in lines) + "\n")
+          with open("/tmp/msg.txt", "w", encoding="utf-8") as f:
+              f.write(msg)
+          print("\n".join(lines))
+          PY
+
+      - name: Commit model.json
+        if: steps.decide.outputs.commit == 'true'
+        run: |
+          cp model.new.json model.json
+          git config user.name "actions-user"
+          git config user.email "actions-user@users.noreply.github.com"
           git add model.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update model.json via GitHub Actions" && git push)
+          if git diff --cached --quiet; then
+            echo "model.json ไม่เปลี่ยน"
+            exit 0
+          fi
+          git commit -m "Auto-update model.json via GitHub Actions"
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Notify Telegram (gate)
+        if: steps.decide.outputs.notify == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "ไม่ได้ตั้ง TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID — ข้ามการแจ้งเตือน"
+            exit 0
+          fi
+          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text@/tmp/msg.txt" > /dev/null
+
+      - name: Notify Telegram (failure)
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then exit 0; fi
+          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=❌ Train workflow ล้มเหลว: ${RUN_URL}" > /dev/null
