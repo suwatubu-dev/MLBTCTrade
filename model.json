@@ -1,5 +1,5 @@
 {
-  "modelVersion": "20261119-170052",
+  "modelVersion": "20261120-023240",
   "nTrain": 18,
   "features": [
     "rsi_dir",
@@ -19,6 +19,7 @@
     "edge_n",
     "isShort"
   ],
+  "zClip": 5.0,
   "mean": {
     "rsi_dir": 0.31793333333333335,
     "rsiH1_dir": 0.27045,
@@ -75,14 +76,21 @@
   },
   "intercept": 0.6777861379061224,
   "walkForward": {
-    "n_oos": 12,
-    "auc": 0.6111111111111112,
-    "brier": 0.3063977679939476,
-    "brier_baseline": 0.3229166666666667,
-    "brier_improvement": 0.016518898672719107,
-    "accuracy@0.5": 0.5833333333333334,
-    "accuracy_majority_baseline": 0.5
+    "n_oos": 6,
+    "gap": 5,
+    "auc": 0.625,
+    "brier": 0.4517588626386875,
+    "brier_baseline": 0.36734693877551017,
+    "brier_improvement": -0.08441192386317731,
+    "accuracy@0.5": 0.3333333333333333,
+    "accuracy_majority_baseline": 0.6666666666666667
   },
+  "deadFeatures": [],
+  "gateReasons": [
+    "\u0e02\u0e49\u0e2d\u0e21\u0e39\u0e25 18 < min-enforce 150",
+    "n_oos 6 < min-oos 100",
+    "Brier \u0e44\u0e21\u0e48\u0e14\u0e35\u0e01\u0e27\u0e48\u0e32 baseline (improvement -0.08441)"
+  ],
   "ready": true,
   "enforceOk": false
 }
