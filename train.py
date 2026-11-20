@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-train.py — ดึงข้อมูลจาก Google Sheets ผ่าน Service Account มาเทรนโมเดล ML แล้วสร้าง model.json
+train.py — ดึงข้อมูลจาก Google Sheets (หรือ CSV) มาเทรนโมเดล ML แล้วสร้าง model.json
+
+ENV (โหมด Google Sheets):
+  GCP_CREDENTIALS_JSON  JSON ของ service account (อาจมีคีย์ "sheet_id" ปนอยู่ก็ได้ เหมือนเดิม)
+  SHEET_ID              (แนะนำ) id ของ Google Sheet — ถ้าไม่ตั้งจะใช้ sheet_id ใน JSON; ไม่มีทั้งคู่ = error
+  SHEET_NAME            ชื่อ worksheet (ค่าเริ่มต้น "Sheet1") — ไม่พบ = error (ไม่เดาชีทอื่นอีกต่อไป)
+
+enforceOk = จำนวนข้อมูลพอ AND ผ่านเกณฑ์คุณภาพ walk-forward (AUC, Brier ดีกว่า baseline, จำนวน OOS)
 """
 import argparse
 import datetime as dt
@@ -8,47 +15,44 @@ import json
 import os
 import sys
 
-import gspread
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 
-from features import MODEL_FEATURES, engineer, to_num
+from features import MODEL_FEATURES, Z_CLIP, engineer, to_num
 
 FEATURE_COLS = ["mlFeatures", "r_ratios"]
-Z_CLIP = 5.0
+NET_PNL_COLS = ["netPnl", "net_pnl", "pnl"]      # ใช้เฉพาะ PnL สุทธิ (หลังหักค่าธรรมเนียม)
+GROSS_PNL_COLS = ["grossPnl"]                   # ใช้เมื่อสั่ง --allow-gross เท่านั้น
+
 
 # ── 0. ดึงข้อมูลจาก Google Sheets ──────────────────────────────────────────────
 
-def fetch_data_from_google_sheets(sheet_name="Sheet1"):
+def fetch_data_from_google_sheets():
+    import gspread  # import ตรงนี้ เพื่อให้โหมด --csv ไม่ต้องติดตั้ง gspread
+
     gcp_json_str = os.environ.get("GCP_CREDENTIALS_JSON")
     if not gcp_json_str:
-        raise ValueError("❌ ไม่พบตัวแปร GCP_CREDENTIALS_JSON ใน Environment Variables / GitHub Secrets")
-    
+        raise SystemExit("❌ ไม่พบตัวแปร GCP_CREDENTIALS_JSON ใน Environment Variables / GitHub Secrets")
     creds_dict = json.loads(gcp_json_str)
+
+    sheet_id = os.environ.get("SHEET_ID") or creds_dict.get("sheet_id")
+    if not sheet_id:
+        raise SystemExit("❌ ไม่พบ SHEET_ID (ตั้ง env SHEET_ID หรือใส่ sheet_id ใน GCP_CREDENTIALS_JSON) "
+                         "— ไม่เดาไฟล์แรกที่เข้าถึงได้อีกต่อไป")
+    sheet_name = os.environ.get("SHEET_NAME", "Sheet1")
+
     gc = gspread.service_account_from_dict(creds_dict)
-    
-    if "sheet_id" in creds_dict and creds_dict["sheet_id"]:
-        sh = gc.open_by_key(creds_dict["sheet_id"])
-    else:
-        sh = gc.openall()[0]
-        
-    # พิมพ์รายชื่อ Worksheet ทั้งหมดที่มีในไฟล์ เพื่อตรวจสอบชื่อชีท
-    available_sheets = [ws.title for ws in sh.worksheets()]
-    print(f"📋 รายชื่อ Worksheet ทั้งหมดใน Google Sheet: {available_sheets}")
-    
-    # เลือกชีทตามชื่อ หรือถ้าไม่เจอให้เลือกชีทแรกที่มีข้อมูล (หรือเปลี่ยนชื่อชีทที่นี่ถ้าจำเป็น)
-    if sheet_name in available_sheets:
-        worksheet = sh.worksheet(sheet_name)
-    else:
-        print(f"⚠️ ไม่พบชีทชื่อ '{sheet_name}' จะใช้ชีทแรกแทน: {available_sheets[0]}")
-        worksheet = sh.get_worksheet(0)
-    
-    records = worksheet.get_all_records()
-    df = pd.DataFrame(records)
-    print(f"🔍 คอลัมน์ที่อ่านได้จากชีท: {list(df.columns)}")
+    sh = gc.open_by_key(sheet_id)
+    names = [ws.title for ws in sh.worksheets()]
+    print(f"📗 Spreadsheet: '{sh.title}' | worksheets: {names}")
+    if sheet_name not in names:
+        raise SystemExit(f"❌ ไม่พบ worksheet ชื่อ '{sheet_name}' (มี: {names}) — ตั้ง env SHEET_NAME ให้ถูกต้อง")
+
+    df = pd.DataFrame(sh.worksheet(sheet_name).get_all_records())
+    print(f"🔍 อ่านจาก '{sheet_name}' ได้ {len(df)} แถว, คอลัมน์: {list(df.columns)}")
     return df
 
 
@@ -78,53 +82,74 @@ def legacy_raw(row):
     }
 
 
-def load_dataset_from_df(df, use_legacy, pnl_threshold):
+def pick_pnl(row, allow_gross, counts):
+    cols = NET_PNL_COLS + (GROSS_PNL_COLS if allow_gross else [])
+    for c in cols:
+        if c in row and row[c] is not None and str(row[c]).strip() != "":
+            v = to_num(row[c])
+            if v is not None:
+                counts[c] = counts.get(c, 0) + 1
+                return v
+    return None
+
+
+def load_dataset_from_df(df, use_legacy, pnl_threshold, allow_gross=False):
+    df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
-    
-    rows, skipped = [], {"not_closed": 0, "no_pnl": 0, "no_features": 0}
+
+    rows = []
+    skipped = {"not_closed": 0, "no_pnl": 0, "no_features": 0, "bad_side": 0, "bad_time": 0}
+    pnl_sources, n_legacy = {}, 0
 
     for i, r in df.iterrows():
         row = r.to_dict()
-        
+
         status = str(row.get("status", "")).strip().upper()
         if status and status not in ["CLOSED", "NAN", "NONE", ""]:
             skipped["not_closed"] += 1
             continue
-            
-        raw_pnl = None
-        for col_name in ["netPnl", "net_pnl", "pnl", "grossPnl"]:
-            if col_name in row and row[col_name] is not None and str(row[col_name]).strip() != "":
-                raw_pnl = row[col_name]
-                break
-                
-        pnl = to_num(raw_pnl)
+
+        pnl = pick_pnl(row, allow_gross, pnl_sources)
         if pnl is None:
             skipped["no_pnl"] += 1
             continue
-            
-        raw = None
+
+        raw, is_legacy = None, False
         for col in FEATURE_COLS:
             if col in row:
                 raw = parse_json_cell(row[col])
                 if raw:
                     break
         if raw is None and use_legacy:
-            raw = legacy_raw(row)
+            raw, is_legacy = legacy_raw(row), True
         if raw is None:
             skipped["no_features"] += 1
             continue
-            
+
+        try:
+            feats = engineer(raw)
+        except ValueError:                      # side ว่าง/ไม่รู้จัก
+            skipped["bad_side"] += 1
+            continue
+
+        n_legacy += int(is_legacy)
         rows.append({
             "t": row.get("openTime", ""), "idx": i, "y": 1 if pnl > pnl_threshold else 0,
-            "pnl": pnl, **engineer(raw),
+            "pnl": pnl, "legacy": is_legacy, **feats,
         })
 
     data = pd.DataFrame(rows)
+    info = {"pnl_sources": pnl_sources, "legacy_rows": n_legacy}
     if data.empty:
-        return data, skipped
+        return data, skipped, info
+
     data["t"] = pd.to_datetime(data["t"], errors="coerce", format="mixed")
-    data = data.sort_values(["t", "idx"], kind="stable", na_position="last").reset_index(drop=True)
-    return data, skipped
+    bad_t = int(data["t"].isna().sum())
+    if bad_t:
+        skipped["bad_time"] = bad_t             # เวลาอ่านไม่ได้ -> ทิ้ง (ไม่ให้ถูกวางเป็น "อนาคต")
+        data = data[data["t"].notna()]
+    data = data.sort_values(["t", "idx"], kind="stable").reset_index(drop=True)
+    return data, skipped, info
 
 
 # ── 2. เทรนและประเมินโมเดล ───────────────────────────────────────────────────
@@ -144,11 +169,26 @@ def predict_model(mean, std, lr, X):
     return lr.predict_proba(Z.values)[:, 1]
 
 
-def walk_forward(X, y, C):
-    n = len(y)
+def make_splitter(n, gap):
+    """TimeSeriesSplit พร้อม gap (กันผลของไม้ที่ยังไม่ปิดรั่วข้ามชุด); ลด gap อัตโนมัติถ้าข้อมูลน้อย"""
     n_splits = max(2, min(5, n // 25))
+    for g in (gap, 0):
+        try:
+            splitter = TimeSeriesSplit(n_splits=n_splits, gap=g)
+            list(splitter.split(np.arange(n)))   # ทดสอบว่าใช้ได้
+            return splitter, g
+        except ValueError:
+            continue
+    return None, 0
+
+
+def walk_forward(X, y, C, gap):
+    n = len(y)
+    splitter, used_gap = make_splitter(n, gap)
+    if splitter is None:
+        return None
     ys, ps, base = [], [], []
-    for tr, te in TimeSeriesSplit(n_splits=n_splits).split(X):
+    for tr, te in splitter.split(X):
         if len(set(y[tr])) < 2:
             continue
         mean, std, lr = fit_model(X.iloc[tr], y[tr], C)
@@ -162,12 +202,29 @@ def walk_forward(X, y, C):
     brier_base = float(brier_score_loss(ys, base))
     maj = max(ys.mean(), 1 - ys.mean())
     return {
-        "n_oos": int(len(ys)), "auc": auc,
+        "n_oos": int(len(ys)), "gap": int(used_gap), "auc": auc,
         "brier": brier, "brier_baseline": brier_base,
         "brier_improvement": brier_base - brier,
         "accuracy@0.5": float(((ps >= 0.5) == (ys == 1)).mean()),
         "accuracy_majority_baseline": float(maj),
     }
+
+
+def evaluate_gate(wf, n_samples, args):
+    """คืน (ผ่านไหม, เหตุผลที่ไม่ผ่าน)"""
+    reasons = []
+    if n_samples < args.min_enforce:
+        reasons.append(f"ข้อมูล {n_samples} < min-enforce {args.min_enforce}")
+    if not wf:
+        reasons.append("walk-forward คำนวณไม่ได้")
+    else:
+        if wf["n_oos"] < args.min_oos:
+            reasons.append(f"n_oos {wf['n_oos']} < min-oos {args.min_oos}")
+        if wf["auc"] is None or wf["auc"] < args.min_auc:
+            reasons.append(f"AUC {wf['auc']} < min-auc {args.min_auc}")
+        if wf["brier_improvement"] <= 0:
+            reasons.append(f"Brier ไม่ดีกว่า baseline (improvement {wf['brier_improvement']:.5f})")
+    return (not reasons), reasons
 
 
 # ── 3. ฟังก์ชันหลัก ─────────────────────────────────────────────────────────────
@@ -177,11 +234,15 @@ def main():
     ap.add_argument("--csv", default=None, help="ถ้าใส่ path csv จะอ่านจากไฟล์แทน Google Sheets")
     ap.add_argument("--out", default="model.json", help="Path สำหรับเซฟไฟล์โมเดล JSON")
     ap.add_argument("--min-train", type=int, default=10, help="จำนวนข้อมูลขั้นต่ำสำหรับเทรน")
-    ap.add_argument("--min-enforce", type=int, default=50, help="จำนวนข้อมูลขั้นต่ำสำหรับบังคับใช้โมเดล")
+    ap.add_argument("--min-enforce", type=int, default=150, help="จำนวนข้อมูลขั้นต่ำสำหรับ enforceOk")
+    ap.add_argument("--min-oos", type=int, default=100, help="จำนวนตัวอย่าง out-of-sample ขั้นต่ำสำหรับ enforceOk")
+    ap.add_argument("--min-auc", type=float, default=0.55, help="AUC walk-forward ขั้นต่ำสำหรับ enforceOk")
+    ap.add_argument("--gap", type=int, default=5, help="จำนวนแถวที่เว้นระหว่างชุดเทรนกับชุดทดสอบ")
     ap.add_argument("--pnl-threshold", type=float, default=0.0, help="เกณฑ์กำไร PnL สำหรับตัดสินชนะ/แพ้")
     ap.add_argument("--C", type=float, default=1.0, help="ค่า Regularization C ของ LogisticRegression")
     ap.add_argument("--force", action="store_true", help="บังคับสร้างโมเดลแม้ข้อมูลน้อยกว่า min-train")
     ap.add_argument("--no-legacy", action="store_true", help="ปิดการดึงฟีเจอร์แบบเก่า")
+    ap.add_argument("--allow-gross", action="store_true", help="อนุญาตใช้ grossPnl เมื่อไม่มี netPnl (ไม่แนะนำ)")
     args = ap.parse_args()
 
     print("🚀 เริ่มต้นกระบวนการเทรนโมเดล...")
@@ -191,40 +252,73 @@ def main():
         df = pd.read_csv(args.csv)
     else:
         print("🌐 กำลังดึงข้อมูลจาก Google Sheets...")
-        # หากชื่อชีทจริงไม่ใช่ "Sheet1" สามารถเปลี่ยนพารามิเตอร์ตรงนี้ได้ เช่น fetch_data_from_google_sheets("ชื่อชีทของคุณ")
-        df = fetch_data_from_google_sheets("Sheet1")
+        df = fetch_data_from_google_sheets()
 
-    data, skipped = load_dataset_from_df(df, use_legacy=not args.no_legacy, pnl_threshold=args.pnl_threshold)
+    data, skipped, info = load_dataset_from_df(
+        df, use_legacy=not args.no_legacy, pnl_threshold=args.pnl_threshold, allow_gross=args.allow_gross)
     n_samples = len(data)
 
-    print(f"📊 โหลดข้อมูลเสร็จสิ้น: ทั้งหมด {len(df)} แถว, ข้อมูลพร้อมเทรน {n_samples} แถว (Skipped: {skipped})")
+    print(f"📊 ทั้งหมด {len(df)} แถว, พร้อมเทรน {n_samples} แถว | Skipped: {skipped}")
+    print(f"💰 แหล่ง PnL ที่ใช้: {info['pnl_sources']} | แถว legacy: {info['legacy_rows']}")
+    if info["legacy_rows"]:
+        print("⚠️ มีแถว legacy (ฟีเจอร์ไม่ครบและสเกล edge อาจต่างจากข้อมูลใหม่) — พิจารณา --no-legacy")
 
     if n_samples < args.min_train and not args.force:
         print(f"⚠️ ข้อมูลไม่เพียงพอสำหรับเทรน (ต้องการขั้นต่ำ {args.min_train} แถว แต่มี {n_samples} แถว)")
         sys.exit(0)
+    if n_samples == 0:
+        raise SystemExit("❌ ไม่มีข้อมูลเลย")
 
     features = [f for f in MODEL_FEATURES if f in data.columns]
-    X = data[features]
-    y = data["y"]
+    if features != MODEL_FEATURES:
+        raise SystemExit(f"❌ features ไม่ครบ: {sorted(set(MODEL_FEATURES) - set(features))}")
+
+    X = data[features].apply(pd.to_numeric, errors="coerce").astype(float)
+    y = data["y"].to_numpy()
+
+    if len(np.unique(y)) < 2:
+        print("⚠️ label มีคลาสเดียว (ชนะหมดหรือแพ้หมด) เทรนไม่ได้ — ไม่สร้างโมเดลใหม่")
+        sys.exit(0)
+
+    coverage = X.notna().mean()
+    dead = [f for f in features if coverage[f] == 0]
+    sparse = {f: round(float(coverage[f]), 2) for f in features if 0 < coverage[f] < 0.8}
+    if dead:
+        print(f"⚠️ ฟีเจอร์ที่ไม่มีข้อมูลเลย (ไม่มีผลต่อโมเดล): {dead}")
+    if sparse:
+        print(f"⚠️ ฟีเจอร์ที่มีข้อมูล < 80%: {sparse}")
 
     mean, std, lr = fit_model(X, y, args.C)
-    wf_metrics = walk_forward(X, y, args.C)
+    wf = walk_forward(X, y, args.C, args.gap)
+    gate_ok, reasons = evaluate_gate(wf, n_samples, args)
+
+    coefs = dict(zip(features, lr.coef_[0].tolist()))
+    print("📐 coefficients (เรียงตามขนาด):")
+    for k, v in sorted(coefs.items(), key=lambda kv: -abs(kv[1])):
+        print(f"   {k:15s} {v:+.4f}")
+    print(f"📈 walk-forward: {wf}")
+    print(f"🚦 enforceOk = {gate_ok}" + ("" if gate_ok else f"  (เหตุผล: {'; '.join(reasons)})"))
 
     model_artifact = {
         "modelVersion": dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S"),
         "nTrain": n_samples,
         "features": features,
+        "zClip": Z_CLIP,
         "mean": mean.to_dict(),
         "std": std.to_dict(),
-        "coefficients": dict(zip(features, lr.coef_[0].tolist())),
+        "coefficients": coefs,
         "intercept": float(lr.intercept_[0]),
-        "walkForward": wf_metrics,
+        "walkForward": wf,
+        "deadFeatures": dead,
+        "gateReasons": reasons,
         "ready": True,
-        "enforceOk": n_samples >= args.min_enforce
+        "enforceOk": bool(gate_ok),
     }
 
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(model_artifact, f, indent=2)
+    tmp = args.out + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(model_artifact, f, indent=2, allow_nan=False)
+    os.replace(tmp, args.out)                   # เขียนแบบ atomic กันไฟล์ค้างครึ่งเดียว
 
     print(f"✅ บันทึกโมเดลเรียบร้อยแล้วไปที่: {args.out}")
 
