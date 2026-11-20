@@ -9,6 +9,8 @@ ENV:
   ALLOW_NO_AUTH      ตั้งเป็น "1" เพื่อปิดการตรวจคีย์ (ใช้เฉพาะตอนทดสอบในเครื่อง)
   MAX_MISSING_RATIO  สัดส่วน feature ที่ขาดได้สูงสุด (ค่าเริ่มต้น 0.2 = 20%)
   MODEL_PATH         path ของ model.json
+
+n8n ควรตรวจ: ready == true, enforceOk == true, unknownKeys ว่าง, prob >= threshold
 """
 import hmac
 import json
@@ -19,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Body, FastAPI, Header, HTTPException
 
-from features import MODEL_FEATURES, engineer
+from features import MODEL_FEATURES, RAW_KEYS, Z_CLIP, engineer
 
 log = logging.getLogger("btc-ml-api")
 logging.basicConfig(level=logging.INFO)
@@ -27,7 +29,6 @@ logging.basicConfig(level=logging.INFO)
 MODEL_PATH = os.environ.get("MODEL_PATH", os.path.join(os.path.dirname(__file__), "model.json"))
 API_KEY = os.environ.get("API_KEY", "")
 ALLOW_NO_AUTH = os.environ.get("ALLOW_NO_AUTH", "") == "1"
-Z_CLIP = 5.0
 
 
 def _read_ratio(name: str, default: float) -> float:
@@ -40,7 +41,7 @@ def _read_ratio(name: str, default: float) -> float:
 
 MAX_MISSING_RATIO = _read_ratio("MAX_MISSING_RATIO", 0.2)
 
-app = FastAPI(title="BTC ML API", version="1.1")
+app = FastAPI(title="BTC ML API", version="1.2")
 
 
 # --------------------------------------------------------------------------
@@ -66,7 +67,6 @@ def load_model(path: str = MODEL_PATH) -> Optional[Dict[str, Any]]:
         log.error("model features do not match features.py")
         return None
 
-    # ตรวจความสมบูรณ์ของพารามิเตอร์โมเดลตั้งแต่ตอนโหลด
     coef = m.get("coefficients", m.get("coef", {}))
     try:
         if not is_valid_number(m.get("intercept")):
@@ -76,6 +76,9 @@ def load_model(path: str = MODEL_PATH) -> Optional[Dict[str, Any]]:
                 raise ValueError(f"mean/std of {k}")
             if not is_valid_number(coef.get(k, 0.0)):
                 raise ValueError(f"coef of {k}")
+        z = m.get("zClip", Z_CLIP)
+        if not is_valid_number(z) or z <= 0:
+            raise ValueError("zClip")
     except (KeyError, TypeError, ValueError) as e:
         log.error("model file is incomplete or invalid: %s", e)
         return None
@@ -95,15 +98,15 @@ def check_key(x_api_key: Optional[str]) -> None:
     if not API_KEY:
         if ALLOW_NO_AUTH:
             return
-        # fail closed: ไม่ตั้งคีย์ = ไม่ให้ใช้งาน
         raise HTTPException(status_code=503, detail="server auth is not configured")
     if not x_api_key or not hmac.compare_digest(x_api_key, API_KEY):
         raise HTTPException(status_code=401, detail="invalid api key")
 
 
 def predict_prob(model: Dict[str, Any], raw: Dict[str, Any]) -> Tuple[Optional[float], List[str]]:
-    feats = engineer(raw)
+    feats = engineer(raw)                      # raise ValueError ถ้า side ผิด
     coef_dict = model.get("coefficients", model.get("coef", {}))
+    z_clip = float(model.get("zClip", Z_CLIP))
 
     missing: List[str] = []
     logit = float(model["intercept"])
@@ -111,10 +114,10 @@ def predict_prob(model: Dict[str, Any], raw: Dict[str, Any]) -> Tuple[Optional[f
     for k in model["features"]:
         v = feats.get(k)
         if not is_valid_number(v):
-            missing.append(k)           # None / NaN / Inf / ชนิดข้อมูลผิด
+            missing.append(k)                  # None / NaN / Inf / ชนิดข้อมูลผิด
             continue
         std = max(float(model["std"][k]), 1e-9)
-        z = max(-Z_CLIP, min(Z_CLIP, (float(v) - float(model["mean"][k])) / std))
+        z = max(-z_clip, min(z_clip, (float(v) - float(model["mean"][k])) / std))
         logit += float(coef_dict.get(k, 0.0)) * z
 
     if not math.isfinite(logit):
@@ -124,14 +127,17 @@ def predict_prob(model: Dict[str, Any], raw: Dict[str, Any]) -> Tuple[Optional[f
     return prob, missing
 
 
-def not_ready(model: Optional[Dict[str, Any]], note: str, missing: Optional[List[str]] = None) -> Dict[str, Any]:
+def response(model: Optional[Dict[str, Any]], *, prob: Optional[float] = None, ready: bool = False,
+             missing: Optional[List[str]] = None, unknown: Optional[List[str]] = None,
+             note: str = "") -> Dict[str, Any]:
     return {
-        "prob": None,
-        "ready": False,
-        "enforceOk": False,
+        "prob": None if prob is None else round(prob, 4),
+        "ready": ready,
+        "enforceOk": bool(model.get("enforceOk", False)) if (model and ready) else False,
         "modelVersion": model.get("modelVersion") if model else None,
         "nTrain": model.get("nTrain", 0) if model else 0,
         "missing": missing or [],
+        "unknownKeys": unknown or [],
         "note": note,
     }
 
@@ -147,6 +153,7 @@ def health():
         "ready": MODEL is not None,
         "modelVersion": MODEL.get("modelVersion") if MODEL else None,
         "nTrain": MODEL.get("nTrain") if MODEL else 0,
+        "enforceOk": bool(MODEL.get("enforceOk", False)) if MODEL else False,
         "authConfigured": bool(API_KEY),
         "maxMissingRatio": MAX_MISSING_RATIO,
     }
@@ -157,31 +164,25 @@ def predict(payload: Dict[str, Any] = Body(...), x_api_key: Optional[str] = Head
     check_key(x_api_key)
 
     if MODEL is None:
-        return not_ready(None, "no model loaded")
+        return response(None, note="no model loaded")
+
+    # คีย์ที่ไม่อยู่ใน RAW_KEYS มักแปลว่า n8n สะกดผิดหรือเปลี่ยนชื่อ -> รายงานให้ n8n เห็น
+    unknown = sorted(k for k in payload if k not in RAW_KEYS)
 
     try:
         prob, missing = predict_prob(MODEL, payload)
-    except Exception as e:  # engineer() อาจ error เมื่อ payload ผิดรูปแบบ
-        log.exception("predict failed")
-        return not_ready(MODEL, f"bad input: {type(e).__name__}")
+    except Exception as e:  # เช่น side ผิด หรือ payload ผิดรูปแบบ
+        log.warning("predict rejected: %s", e)
+        return response(MODEL, unknown=unknown, note=f"bad input: {e}")
 
     n_feat = len(MODEL["features"])
     if n_feat and len(missing) / n_feat > MAX_MISSING_RATIO:
-        return not_ready(
-            MODEL,
-            f"too many missing features: {len(missing)}/{n_feat} (max {MAX_MISSING_RATIO:.0%})",
-            missing,
+        return response(
+            MODEL, missing=missing, unknown=unknown,
+            note=f"too many missing features: {len(missing)}/{n_feat} (max {MAX_MISSING_RATIO:.0%})",
         )
 
     if prob is None or not math.isfinite(prob):
-        return not_ready(MODEL, "invalid prediction", missing)
+        return response(MODEL, missing=missing, unknown=unknown, note="invalid prediction")
 
-    return {
-        "prob": round(prob, 4),
-        "ready": True,
-        "enforceOk": bool(MODEL.get("enforceOk", False)),
-        "modelVersion": MODEL.get("modelVersion"),
-        "nTrain": MODEL.get("nTrain"),
-        "missing": missing,
-        "note": "",
-    }
+    return response(MODEL, prob=prob, ready=True, missing=missing, unknown=unknown)
